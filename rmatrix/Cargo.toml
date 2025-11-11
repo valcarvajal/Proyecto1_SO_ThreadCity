@@ -1,0 +1,11 @@
+[package]
+name = "rmatrix"
+version = "0.1.0"
+edition = "2024"
+authors = ["Anthony Rojas <ajrojasfuentes@gmail.com>"]
+description = "Una librería para manejo de matrices en Rust"
+
+[dependencies]
+num-traits = "0.2.19"
+
+[dev-dependencies]

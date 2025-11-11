@@ -2,6 +2,10 @@
 name = "mypthreads"
 version = "0.1.0"
 edition = "2024"
+authors = ["Valery Carvajal", "Anthony Rojas"]
+description = "Implementación personalizada de pthreads con mutex incluido"
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]

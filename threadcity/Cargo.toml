@@ -1,0 +1,9 @@
+[package]
+name = "threadcity"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rmatrix = { path = "/home/ajrf/Documents/GitHub/Rust/rmatrix" }
+mypthreads = { path = "/home/ajrf/Documents/GitHub/Rust/mypthreads" }
+
