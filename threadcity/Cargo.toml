@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rmatrix = { path = "/home/ajrf/Documents/GitHub/Rust/rmatrix" }
-mypthreads = { path = "/home/ajrf/Documents/GitHub/Rust/mypthreads" }
-
+mypthreads = { path = "../mypthreads" }
+rmatrix = { path = "../rmatrix" }
+rand = "0.8"

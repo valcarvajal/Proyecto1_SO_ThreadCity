@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use mypthreads::*;
 use rmatrix::*;
+mod bfs;
+use bfs::bfs_path;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 /// --------------------------------------------------------------------------- ///
 ///                                 Vehiculos                                   ///
@@ -519,48 +523,28 @@ pub fn is_valid_position_for_vehicle(city: &Matrix<Block>, pos: Coord, vehicle_k
 /// --------------------------------------------------------------------------- ///
 
 fn main() {
-    // Crear la ciudad detallada
-    let mut city = build_city();
-    
-    // Mostrar la ciudad
+    let city = build_city();
     print_detailed_city(&city);
-    
-    // Mostrar estadísticas
-    let kind_stats = count_blocks_by_kind(&city);
-    let spawn_positions = find_spawn_positions(&city);
-    
-    println!("\n=== ESTADÍSTICAS DE LA CIUDAD ===");
-    println!("\nPor tipo de bloque:");
-    for (kind, count) in kind_stats {
-        let kind_name = match kind {
-            BlockKind::Path => "Path",
-            BlockKind::Building => "Building",
-            BlockKind::River => "River",
-            BlockKind::Shop => "Shop",
-            BlockKind::NuclearPlant => "NuclearPlant",
-            BlockKind::Hospital => "Hospital",
-            BlockKind::Dock => "Dock",
-        };
-        println!("  {}: {}", kind_name, count);
-    }
-    
-    println!("Posiciones de spawn: {}", spawn_positions.len());
-    
-    // Ejemplo de uso para validación de posiciones
-    println!("\n=== VALIDACIÓN DE VEHÍCULOS ===");
-    let test_positions = [(0, 0), (10, 0), (12, 8), (4, 4)];
-    
-    for &pos in &test_positions {
-        println!("\nPosición {:?}:", pos);
-        for vehicle_kind in [
-            VehicleKind::Car,
-            VehicleKind::Ambulance, 
-            VehicleKind::TruckWater,
-            VehicleKind::TruckRadioactive,
-            VehicleKind::Boat,
-        ].iter() {
-            let is_valid = is_valid_position_for_vehicle(&city, pos, *vehicle_kind);
-            println!("  {:?}: {}", vehicle_kind, is_valid);
+
+    let spawn_points = find_spawn_positions(&city);
+    let mut rng = thread_rng();
+
+    let mut found = false;
+    for _ in 0..50 {
+        let start = *spawn_points.choose(&mut rng).unwrap();
+        let mut goal = *spawn_points.choose(&mut rng).unwrap();
+        while goal == start {
+            goal = *spawn_points.choose(&mut rng).unwrap();
         }
+
+        if let Some(path) = bfs_path(&city, start, goal, VehicleKind::Car) {
+            println!("\n✅ Ruta encontrada entre {:?} y {:?} con {} pasos.", start, goal, path.len());
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        println!("⚠️ No se encontró ninguna ruta válida tras varios intentos.");
     }
 }
