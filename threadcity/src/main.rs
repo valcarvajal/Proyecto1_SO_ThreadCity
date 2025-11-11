@@ -6,6 +6,10 @@ mod bfs;
 use bfs::bfs_path;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use std::ffi::c_void;
+use std::ptr;
+use std::time::Duration;
+use std::thread::sleep;
 
 /// --------------------------------------------------------------------------- ///
 ///                                 Vehiculos                                   ///
@@ -65,7 +69,6 @@ impl Vehicle {
             thread_id: None,
         }
     }
-    
 }
 
 /// --------------------------------------------------------------------------- ///
@@ -518,33 +521,103 @@ pub fn is_valid_position_for_vehicle(city: &Matrix<Block>, pos: Coord, vehicle_k
     }
 }
 
+/// Función que ejecuta cada hilo de vehículo.
+/// El argumento será un puntero a un Vehicle.
+extern "C" fn vehicle_thread(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        // Recuperar el vehículo desde el puntero
+        let vehicle: &mut Vehicle = &mut *(arg as *mut Vehicle);
+
+        println!("🚗 Iniciando vehículo {:?} desde {:?} hacia {:?}", vehicle.kind, vehicle.pos, vehicle.dest);
+
+        while let Some(next_pos) = vehicle.route.first().cloned() {
+            // Simular movimiento: bloquear siguiente bloque
+            println!("   -> Vehículo {:?} moviéndose a {:?}", vehicle.kind, next_pos);
+            vehicle.pos = next_pos;
+            vehicle.route.remove(0);
+
+            // Simular tiempo de desplazamiento (varía por tipo)
+            let delay = match vehicle.kind {
+                VehicleKind::Ambulance => 200,
+                VehicleKind::Car => 400,
+                VehicleKind::TruckWater | VehicleKind::TruckRadioactive => 600,
+                VehicleKind::Boat => 800,
+            };
+            my_thread_yield(); // cede CPU al scheduler cooperativo
+            sleep(Duration::from_millis(delay));
+        }
+
+        println!("✅ Vehículo {:?} llegó a destino {:?}", vehicle.kind, vehicle.dest);
+
+        ptr::null_mut()
+    }
+}
+
 /// --------------------------------------------------------------------------- ///
 ///                                  Ejecución                                  ///
 /// --------------------------------------------------------------------------- ///
 
 fn main() {
+    println!("🏙️ Iniciando simulación ThreadCity...");
+
+    // Crear ciudad
     let city = build_city();
     print_detailed_city(&city);
 
+    // Obtener puntos de spawn
     let spawn_points = find_spawn_positions(&city);
     let mut rng = thread_rng();
 
-    let mut found = false;
-    for _ in 0..50 {
+    let mut vehicles: Vec<Vehicle> = Vec::new();
+
+    // Crear 5 vehículos de distintos tipos
+    let vehicle_types = [
+        VehicleKind::Car,
+        VehicleKind::Ambulance,
+        VehicleKind::TruckWater,
+        VehicleKind::TruckRadioactive,
+        VehicleKind::Boat,
+    ];
+
+    for (i, kind) in vehicle_types.iter().enumerate() {
+        // Elegir inicio y fin distintos
         let start = *spawn_points.choose(&mut rng).unwrap();
         let mut goal = *spawn_points.choose(&mut rng).unwrap();
         while goal == start {
             goal = *spawn_points.choose(&mut rng).unwrap();
         }
 
-        if let Some(path) = bfs_path(&city, start, goal, VehicleKind::Car) {
-            println!("\n✅ Ruta encontrada entre {:?} y {:?} con {} pasos.", start, goal, path.len());
-            found = true;
-            break;
+        // Calcular ruta con BFS
+        if let Some(path) = bfs_path(&city, start, goal, *kind) {
+            let mut vehicle = Vehicle::new(i, *kind, start, goal, SchedPolicy::RoundRobin);
+            vehicle.route = path;
+            vehicles.push(vehicle);
+        } else {
+            println!("⚠️ No se encontró ruta para vehículo {:?}", kind);
         }
     }
 
-    if !found {
-        println!("⚠️ No se encontró ninguna ruta válida tras varios intentos.");
+    println!("\n🚀 Lanzando hilos de vehículos...");
+
+    // Crear hilos para cada vehículo
+    for vehicle in vehicles.iter_mut() {
+        let ptr = vehicle as *mut Vehicle as *mut c_void;
+        let policy = match vehicle.kind {
+            VehicleKind::Ambulance => SchedPolicy::RealTime { deadline: 5000 },
+            VehicleKind::TruckRadioactive => SchedPolicy::Lottery { tickets: 5 },
+            _ => SchedPolicy::RoundRobin,
+        };
+
+        let tid = my_thread_create(vehicle_thread, ptr, policy);
+        vehicle.thread_id = Some(tid);
     }
+
+    // Esperar a que todos los hilos terminen
+    for vehicle in vehicles.iter_mut() {
+        if let Some(tid) = vehicle.thread_id {
+            my_thread_join(tid);
+        }
+    }
+
+    println!("\n🏁 Simulación terminada.");
 }

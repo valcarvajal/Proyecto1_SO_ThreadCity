@@ -1,1 +1,1 @@
-/home/ajrf/Documents/GitHub/ThreadCity/threadcity/target/debug/threadcity: /home/ajrf/Documents/GitHub/Rust/mypthreads/src/lib.rs /home/ajrf/Documents/GitHub/Rust/rmatrix/src/lib.rs /home/ajrf/Documents/GitHub/ThreadCity/threadcity/src/main.rs
+/home/svctiom/Proyecto1_SO_ThreadCity/threadcity/target/debug/threadcity: /home/svctiom/Proyecto1_SO_ThreadCity/mypthreads/src/lib.rs /home/svctiom/Proyecto1_SO_ThreadCity/rmatrix/src/lib.rs /home/svctiom/Proyecto1_SO_ThreadCity/threadcity/src/bfs.rs /home/svctiom/Proyecto1_SO_ThreadCity/threadcity/src/main.rs
