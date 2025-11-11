@@ -470,7 +470,45 @@ impl Scheduler {
 
         0
     }
+
+    /// Actualiza el deadline de un hilo en el scheduler de Tiempo Real.
+    ///
+    /// El `deadline` se interpreta como un tiempo absoluto en las mismas
+    /// unidades que use la simulación (por ejemplo, ticks). Solo es válido
+    /// para hilos cuya política actual sea `SchedPolicy::RealTime`, en caso
+    /// contrario se devuelve `EINVAL`.
+    fn set_realtime_deadline(&mut self, tid: MyThreadId, deadline: u64) -> c_int {
+        // Verificamos que el hilo exista.
+        let thr = match self.threads.get_mut(&tid) {
+            None => return EINVAL,
+            Some(t) => t,
+        };
+
+        // Solo tiene sentido actualizar el deadline de hilos Tiempo Real.
+        match thr.scheduler {
+            SchedPolicy::RealTime { .. } => {
+                thr.rt_params = Some(RealTimeParams { deadline });
+            }
+            _ => return EINVAL,
+        }
+
+        // Si estaba listo, lo reinsertamos en la lista Tiempo Real
+        // para que el orden por deadline se actualice.
+        if thr.state == ThreadState::Ready {
+            self.remove_from_ready_lists(tid);
+            self.realtime_list.push(tid);
+        }
+
+        0
+    }
+
+    /// Obtiene el deadline actual de un hilo de Tiempo Real, si lo tiene.
+    fn get_realtime_deadline(&self, tid: MyThreadId) -> Option<u64> {
+        let thr = self.threads.get(&tid)?;
+        thr.rt_params.as_ref().map(|p| p.deadline)
+    }
 }
+
 
 /// Scheduler global en espacio de usuario.
 static mut SCHEDULER: *mut Scheduler = std::ptr::null_mut();
@@ -579,7 +617,23 @@ pub fn my_thread_chsched(tid: MyThreadId, policy: SchedPolicy) -> c_int {
     unsafe { scheduler().change_scheduler(tid, policy) }
 }
 
-// ============ Implementación del mutex propio (mymutex) ============ //
+/// Actualiza el `deadline` de un hilo de Tiempo Real.
+///
+/// El valor de `deadline` es un tiempo absoluto expresado en las mismas
+/// unidades que utilice la simulación (por ejemplo, ticks). Este llamado
+/// solo es válido si el hilo fue configurado con `SchedPolicy::RealTime`.
+/// En caso contrario, devuelve `EINVAL`.
+
+pub fn my_thread_set_realtime_deadline(tid: MyThreadId, deadline: u64) -> c_int {
+    unsafe { scheduler().set_realtime_deadline(tid, deadline) }
+}
+
+/// Devuelve el `deadline` actual de un hilo de Tiempo Real, si existe.
+pub fn my_thread_get_realtime_deadline(tid: MyThreadId) -> Option<u64> {
+    unsafe { scheduler().get_realtime_deadline(tid) }
+}
+
+/// ============ Implementación del mutex propio (mymutex) ============ ///
 
 #[derive(Debug)]
 pub struct MyMutex {

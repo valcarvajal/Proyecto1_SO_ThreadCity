@@ -1,11 +1,44 @@
 use std::collections::HashMap;
-use mypthreads::{MyMutex, MyThreadId, SchedPolicy};
+use std::sync::atomic::{AtomicU64, Ordering};
+use mypthreads::*;
 use rmatrix::*;
 
+static SIM_TIME: AtomicU64 = AtomicU64::new(0);
+
+/// Tiempo de simulación actual (en ticks lógicos).
+pub fn sim_time_now() -> u64 {
+    SIM_TIME.load(Ordering::Relaxed)
+}
+
+/// Avanza el tiempo de simulación en `delta` ticks.
+pub fn sim_time_advance(delta: u64) {
+    SIM_TIME.fetch_add(delta, Ordering::Relaxed);
+}
+
+/// Ancho y altura de la grid de la ciudad.
 pub const GRID_WIDTH: usize = 16;
 pub const GRID_HEIGHT: usize = 20;
 
-/// Coordenada (x, y) en la grilla: x = columna, y = fila.
+/// Número mínimo y máximo de carros en la simulación.
+const MIN_CARS: usize = 23;
+const MAX_CARS: usize = 27;
+
+/// Contador atómico de carros activos en la simulación.
+static ACTIVE_CARS: AtomicUsize = AtomicUsize::new(0);
+
+fn active_cars() -> usize {
+    ACTIVE_CARS.load(Ordering::Relaxed)
+}
+
+fn inc_cars() {
+    ACTIVE_CARS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn dec_cars() {
+    ACTIVE_CARS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Coordenada (x, y) en la grid: x = columna, y = fila.
 pub type Coord = (usize, usize);
 
 /// ID lógico de vehículo dentro de la simulación.
@@ -160,21 +193,21 @@ pub fn create_detailed_city() -> Matrix<Block> {
 /// Función auxiliar para imprimir la ciudad de forma legible
 pub fn print_detailed_city(city: &Matrix<Block>) {
     println!("Mapa detallado de la ciudad ({}x{}):", city.rows(), city.cols());
-    println!("Leyenda: '.' = Path, 'X' = Building, '~' = River");
-    println!("        'S' = Shop, 'N' = NuclearPlant, 'H' = Hospital, 'D' = Dock");
-    println!("        'F' = Finish task");
+    println!("Leyenda: ");
+    println!("'•' = Path, '■' = Building, '~' = River, '⌂' = Shop");
+    println!("'☢' = NuclearPlant, '✙' = Hospital, '█' = Dock, '◉' = Spawn task");
     
     for row in 0..city.rows() {
         for col in 0..city.cols() {
             let block = city.get(row, col);
             let symbol = match block.kind {
                 BlockKind::Path => "•",
-                BlockKind::Building => "X",
+                BlockKind::Building => "■",
                 BlockKind::River => "~",
-                BlockKind::Shop => "S",
-                BlockKind::NuclearPlant => "N",
-                BlockKind::Hospital => "H",
-                BlockKind::Dock => "D",
+                BlockKind::Shop => "⌂",
+                BlockKind::NuclearPlant => "☢",
+                BlockKind::Hospital => "✙",
+                BlockKind::Dock => "█",
             };
             
             // Mostrar si tiene task Finish
