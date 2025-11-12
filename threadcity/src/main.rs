@@ -11,7 +11,6 @@ use std::ffi::c_void;
 use std::{fmt, ptr};
 use std::ptr::null_mut;
 use std::time::Duration;
-use std::thread::sleep;
 
 use crate::city_design::CITY_DESIGN;
 
@@ -31,6 +30,8 @@ pub const MAX_VEHICLES: usize = 10;
 // Número de vehículos totales a simular
 pub const TOTAL_VEHICLES: usize = 25;
 
+pub static mut COUNT: usize = 0;
+
 /// Tipos de vehículos
 #[derive(Copy, Clone, Hash, Debug, PartialEq, Eq)]
 pub enum VehicleKind {
@@ -39,6 +40,12 @@ pub enum VehicleKind {
     TruckWater,        // camión de agua
     TruckRadioactive,  // camión de material radiactivo
     Boat,              // barco
+}
+
+impl fmt::Display for VehicleKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 /// Struct de vehículo.
@@ -60,17 +67,18 @@ impl Vehicle {
     }
 }
 
-extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
+extern "C" fn vehicle_thread(arg: *mut c_void) -> *mut c_void {
     unsafe {
         // Recuperar y tomar propiedad de los argumentos
         let mut boxed_args: Box<Vehicle> = Box::from_raw(arg as *mut Vehicle);
         let id   = boxed_args.id;
         let kind = boxed_args.kind;
         let mut route = std::mem::take(&mut boxed_args.route);
+        let count = 0;
         drop(boxed_args);
 
         if route.is_empty() {
-            println!("[Car {}] Ruta vacía, terminando.", id);
+            println!("[{} {}] Ruta vacía, terminando.", kind.to_string(), id);
             return ptr::null_mut();
         }
 
@@ -85,7 +93,7 @@ extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
             block.set_occupant(Some(id));
         }
 
-        println!("[Car {}] Inicia en {:?}, destino {:?}", id, pos, route.last());
+        println!("[{} {}] Inicia en {:?}, destino {:?}", kind.to_string(), id, pos, route.last());
 
         // Recorrer la ruta
         while let Some(next_pos) = route.first().copied() {
@@ -94,8 +102,8 @@ extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
                 Some(d) => d,
                 None => {
                     println!(
-                        "[Car {}] ERROR: {:?} no es vecino directo de {:?}, abortando ruta.",
-                        id, next_pos, pos
+                        "[{} {}] ERROR: {:?} no es vecino directo de {:?}, abortando ruta.",
+                        kind.to_string(), id, next_pos, pos
                     );
                     break;
                 }
@@ -106,8 +114,8 @@ extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
                 let curr_block = city_ref.get(pos.0, pos.1);
                 if !curr_block.allows_direction(dir) {
                     println!(
-                        "[Car {}] ERROR: intento mover {:?} -> {:?} en dirección {} pero el bloque no lo permite, abortando ruta.",
-                        id, pos, next_pos, dir.to_string(),
+                        "[{} {}] ERROR: intento mover {:?} -> {:?} en dirección {} pero el bloque no lo permite, abortando ruta.",
+                        kind.to_string(), id, pos, next_pos, dir.to_string(),
                     );
                     break;
                 }
@@ -123,8 +131,9 @@ extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
             if rc != 0 {
                 // Condición de carrera / contención sobre el recurso (bloque destino)
                 println!(
-                    "[RACE] Car {} quiere entrar a {:?} (dir {}) pero el recurso está ocupado; \
+                    "[RACE] {} {} quiere entrar a {:?} (dir {}) pero el recurso está ocupado; \
 scheduler prioriza a otro vehículo mientras este hilo cede CPU.",
+                    kind.to_string(),
                     id,
                     next_pos,
                     dir.to_string(),
@@ -146,8 +155,8 @@ scheduler prioriza a otro vehículo mientras este hilo cede CPU.",
                 // Por seguridad, verificar que destino no tenía ocupante
                 if (*next_block_ptr).get_occupant().is_some() {
                     println!(
-                        "[Car {}] WARNING: bloque {:?} ya tenía ocupante a pesar del lock, liberando y reintentando.",
-                        id, next_pos
+                        "[{} {}] WARNING: bloque {:?} ya tenía ocupante a pesar del lock, liberando y reintentando.",
+                        kind.to_string(), id, next_pos
                     );
                     my_mutex_unlock(&mut (*next_block_ptr).lock);
                     my_thread_yield();
@@ -161,7 +170,8 @@ scheduler prioriza a otro vehículo mientras este hilo cede CPU.",
 
             // 4) Loguear movimiento con dirección
             println!(
-                "[Car {}] Mueve {:?} -> {:?} hacia {}",
+                "[{} {}] Mueve {:?} -> {:?} hacia {}",
+                kind.to_string(),
                 id,
                 pos,
                 next_pos,
@@ -184,7 +194,7 @@ scheduler prioriza a otro vehículo mientras este hilo cede CPU.",
             last_block.unlock_block();
         }
 
-        println!("[Car {}] Terminado en {:?}", id, pos);
+        println!("[{} {}] Terminado en {:?}", kind, id, pos);
         ptr::null_mut()
     }
 }
@@ -674,63 +684,127 @@ pub fn is_valid_position_for_vehicle(city: &Matrix<Block>, pos: Coord, vehicle_k
     }
 }
 
-fn run_test_cars() {
-
+pub fn call_car(id : VehicleId) -> usize {
     let spawns = find_spawn_positions(&city());
     let shops = find_shops(&city());
 
-    let mut spawnplace = rand::thread_rng().gen_range(0..spawns.len());
-    let mut shopsplace = rand::thread_rng().gen_range(0..shops.len());
-    let vehicle1 = Vehicle::new(1, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    let spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    let shopsplace = rand::thread_rng().gen_range(0..shops.len());
 
-    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
-    shopsplace = rand::thread_rng().gen_range(0..shops.len());
-    let vehicle2 = Vehicle::new(2, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    let vehicle = Vehicle::new(id, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    
+    let boxed = Box::new(vehicle);
+    let arg_ptr = Box::into_raw(boxed) as *mut c_void;
 
-    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
-    shopsplace = rand::thread_rng().gen_range(0..shops.len());
-    let vehicle3 = Vehicle::new(3, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    let policy: SchedPolicy = SchedPolicy::RoundRobin;
 
-    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
-    shopsplace = rand::thread_rng().gen_range(0..shops.len());
-    let vehicle4 = Vehicle::new(4, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    let tid = my_thread_create(vehicle_thread, arg_ptr, policy);
 
-    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
-    shopsplace = rand::thread_rng().gen_range(0..shops.len());
-    let vehicle5 = Vehicle::new(5, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+    println!("[MAIN] Creado carro {} con tid {} y política {:?}", id, tid, policy);
 
-    let vehicles = vec![vehicle1, vehicle2, vehicle3, vehicle4, vehicle5];
+    tid
+}
 
-    let mut tids = Vec::new();
+pub fn call_ambulance(id : VehicleId) -> usize {
+    let spawns = find_spawn_positions(&city());
+    let hospitals = find_hospitals(&city());
 
-    for vehicle in vehicles {
-        let id = vehicle.id;
+    let spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    let hospitalsplace = rand::thread_rng().gen_range(0..hospitals.len());
 
-        // Empaquetar argumentos en el heap
-        let boxed = Box::new(vehicle);
-        let arg_ptr = Box::into_raw(boxed) as *mut c_void;
+    let vehicle = Vehicle::new(id, VehicleKind::Ambulance, spawns[spawnplace], hospitals[hospitalsplace], city());
+    
+    let boxed = Box::new(vehicle);
+    let arg_ptr = Box::into_raw(boxed) as *mut c_void;
 
-        // Política de scheduling según el carro
-        let policy = match id {
-            1 => SchedPolicy::RoundRobin,
-            2 => SchedPolicy::RoundRobin,
-            3 => SchedPolicy::RoundRobin,
-            4 => SchedPolicy::RoundRobin,
-            5 => SchedPolicy::RoundRobin,
-            _ => SchedPolicy::RoundRobin,
-        };
+    let policy: SchedPolicy = SchedPolicy::Lottery { tickets: 50 };
 
-        let tid = my_thread_create(car_thread, arg_ptr, policy);
-        println!("[MAIN] Creado carro {} con tid {} y política {:?}", id, tid, policy);
-        tids.push(tid);
+    let tid = my_thread_create(vehicle_thread, arg_ptr, policy);
+
+    println!("[MAIN] Creado ambulancia {} con tid {} y política {:?}", id, tid, policy);
+
+    tid
+}
+
+pub fn call_truck_water(id : VehicleId, deadline: u64) -> usize {
+    let spawns = find_spawn_positions(&city());
+    let nuclear_plants = find_nuclear_plants(&city());
+
+    let spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    let nuclear_plants_place = rand::thread_rng().gen_range(0..nuclear_plants.len());
+
+    let vehicle = Vehicle::new(id, VehicleKind::TruckWater, spawns[spawnplace], nuclear_plants[nuclear_plants_place], city());
+
+    let boxed = Box::new(vehicle);
+    let arg_ptr = Box::into_raw(boxed) as *mut c_void;
+
+    let policy: SchedPolicy = SchedPolicy::RealTime { deadline };
+
+    let tid = my_thread_create(vehicle_thread, arg_ptr, policy);
+
+    println!("[MAIN] Creado camión de agua {} con tid {} y política {:?}", id, tid, policy);
+
+    tid
+}
+pub fn call_truck_radioactive(id : VehicleId, deadline: u64) -> usize {
+    let spawns = find_spawn_positions(&city());
+    let nuclear_plants = find_nuclear_plants(&city());
+
+    let spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    let nuclear_plants_place = rand::thread_rng().gen_range(0..nuclear_plants.len());
+
+    let vehicle = Vehicle::new(id, VehicleKind::TruckRadioactive, spawns[spawnplace], nuclear_plants[nuclear_plants_place], city());
+
+    let boxed = Box::new(vehicle);
+    let arg_ptr = Box::into_raw(boxed) as *mut c_void;
+
+    let policy: SchedPolicy = SchedPolicy::RealTime { deadline };
+
+    let tid = my_thread_create(vehicle_thread, arg_ptr, policy);
+
+    println!("[MAIN] Creado camión radioactivo {} con tid {} y política {:?}", id, tid, policy);
+
+    tid
+}
+
+fn run_simulation() {
+
+    let mut cars = Vec::new(); // Vector para almacenar los resultados
+
+    for i in 1..=15 {
+        cars.push(call_car(i));
     }
 
-    // Esperar a que terminen los 5 carros
-    for tid in tids {
+    let mut ambulances = Vec::new();
+    for i in 15..=21 {
+        ambulances.push(call_ambulance(i));
+    }
+
+    let truck_water1 = call_truck_water(22, 15);
+    let truck_radioactive1 = call_truck_radioactive(23, 10);
+
+    let tids1 = vec![
+        cars,
+        ambulances,
+        vec![truck_water1, truck_radioactive1],
+    ].concat();
+
+    // Esperar a que terminen vehículos
+    for tid in tids1 {
         my_thread_join(tid);
     }
 
-    println!("[MAIN] Todos los carros de prueba han terminado.");
+    let truck_water2 = call_truck_water(24, 8);
+    let truck_radioactive2 = call_truck_radioactive(25, 12);
+
+    let tids2 = vec![truck_water2, truck_radioactive2];
+
+        // Esperar a que terminen vehículos
+    for tid in tids2 {
+        my_thread_join(tid);
+    }
+
+    println!("[MAIN] Todos los vehículos de prueba han terminado.");
 }
 
 /// --------------------------------------------------------------------------- ///
@@ -782,10 +856,6 @@ fn main() {
         }
     }
 
-    // Aquí lanzamos la prueba con 5 autos
-    run_test_cars();
-
-    // Ya no necesitamos el testfunc
-    // let testthread = my_thread_create(testfunc, std::ptr::null_mut(), SchedPolicy::RoundRobin);
-    // my_thread_join(testthread);
+    // Aquí lanzamos la simulacion completa
+    run_simulation();
 }
