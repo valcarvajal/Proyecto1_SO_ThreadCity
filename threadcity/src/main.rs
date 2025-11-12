@@ -3,13 +3,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mypthreads::*;
 use rmatrix::*;
 mod bfs;
+mod city_design;
 use bfs::bfs_path;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand;
+use rand::Rng;
 use std::ffi::c_void;
-use std::ptr;
+use std::{fmt, ptr};
+use std::ptr::null_mut;
 use std::time::Duration;
 use std::thread::sleep;
+
+use crate::city_design::CITY_DESIGN;
 
 /// --------------------------------------------------------------------------- ///
 ///                                 Vehiculos                                   ///
@@ -40,34 +44,148 @@ pub enum VehicleKind {
 /// Struct de vehículo.
 #[derive(Debug)]
 pub struct Vehicle {
-    pub id: VehicleId,
-    pub kind: VehicleKind,
-    pub pos: Coord,
-    pub dest: Coord,                     // bloque destino a alcanzar
-    pub route: Vec<Coord>,               // ruta planificada (lista de bloques)
-    pub thread_id: Option<MyThreadId>,   // hilo mypthread que lo controla
+    id: VehicleId,
+    kind: VehicleKind,
+    route: Vec<Coord>,  // incluye posición inicial y todos los pasos
 }
 
 impl Vehicle {
-
-    pub fn run(&mut self) {
-        while self.pos != self.dest {
-            self.pos = self.route[0];
-            self.route.remove(0); 
-        }
-    }
-
-    // Constructor
-
-    pub fn new(id: VehicleId, kind: VehicleKind, pos: Coord, dest: Coord, schedpolicy: SchedPolicy) -> Self {
+    pub fn new(id: VehicleId, kind: VehicleKind, start: Coord, dest: Coord, city: &City) -> Self {
+        let r = bfs_path(city, start, dest, kind);
         Vehicle {
             id,
             kind,
-            pos,
-            dest,
-            route: Vec::new(),
-            thread_id: None,
+            route: r.unwrap_or_else(|| vec![]),
         }
+    }
+}
+
+extern "C" fn car_thread(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        // Recuperar y tomar propiedad de los argumentos
+        let mut boxed_args: Box<Vehicle> = Box::from_raw(arg as *mut Vehicle);
+        let id   = boxed_args.id;
+        let kind = boxed_args.kind;
+        let mut route = std::mem::take(&mut boxed_args.route);
+        drop(boxed_args);
+
+        if route.is_empty() {
+            println!("[Car {}] Ruta vacía, terminando.", id);
+            return ptr::null_mut();
+        }
+
+        // Posición inicial
+        let mut pos = route.remove(0);
+
+        // Tomar lock de la celda inicial y marcar ocupante
+        {
+            let city_ref = city();
+            let block = city_ref.get_mut(pos.0, pos.1);
+            block.lock_block();
+            block.set_occupant(Some(id));
+        }
+
+        println!("[Car {}] Inicia en {:?}, destino {:?}", id, pos, route.last());
+
+        // Recorrer la ruta
+        while let Some(next_pos) = route.first().copied() {
+            // 1) Verificar que next_pos es vecino directo y respeta la dirección del bloque actual
+            let dir = match direction_from_to(pos, next_pos) {
+                Some(d) => d,
+                None => {
+                    println!(
+                        "[Car {}] ERROR: {:?} no es vecino directo de {:?}, abortando ruta.",
+                        id, next_pos, pos
+                    );
+                    break;
+                }
+            };
+
+            {
+                let city_ref = city();
+                let curr_block = city_ref.get(pos.0, pos.1);
+                if !curr_block.allows_direction(dir) {
+                    println!(
+                        "[Car {}] ERROR: intento mover {:?} -> {:?} en dirección {} pero el bloque no lo permite, abortando ruta.",
+                        id, pos, next_pos, dir.to_string(),
+                    );
+                    break;
+                }
+            }
+
+            // 2) Intentar tomar el lock del bloque destino SIN bloquear (para detectar contención)
+            let rc = {
+                let city_ref = city();
+                let next_block_ptr = city_ref.get_mut(next_pos.0, next_pos.1) as *mut Block;
+                my_mutex_trylock(&mut (*next_block_ptr).lock)
+            };
+
+            if rc != 0 {
+                // Condición de carrera / contención sobre el recurso (bloque destino)
+                println!(
+                    "[RACE] Car {} quiere entrar a {:?} (dir {}) pero el recurso está ocupado; \
+scheduler prioriza a otro vehículo mientras este hilo cede CPU.",
+                    id,
+                    next_pos,
+                    dir.to_string(),
+                );
+
+                // Ceder CPU explícitamente: aquí el scheduler (RR/Lottery/RT) decide a quién correr
+                my_thread_yield();
+                continue;
+            }
+
+            // 3) Tenemos lock de destino + todavía mantenemos lock de origen
+            //    Actualizar ocupantes y liberar lock de origen.
+            {
+                let city_ref = city();
+
+                let curr_block_ptr = city_ref.get_mut(pos.0, pos.1) as *mut Block;
+                let next_block_ptr = city_ref.get_mut(next_pos.0, next_pos.1) as *mut Block;
+
+                // Por seguridad, verificar que destino no tenía ocupante
+                if (*next_block_ptr).get_occupant().is_some() {
+                    println!(
+                        "[Car {}] WARNING: bloque {:?} ya tenía ocupante a pesar del lock, liberando y reintentando.",
+                        id, next_pos
+                    );
+                    my_mutex_unlock(&mut (*next_block_ptr).lock);
+                    my_thread_yield();
+                    continue;
+                }
+
+                (*next_block_ptr).set_occupant(Some(id));
+                (*curr_block_ptr).set_occupant(None);
+                my_mutex_unlock(&mut (*curr_block_ptr).lock);
+            }
+
+            // 4) Loguear movimiento con dirección
+            println!(
+                "[Car {}] Mueve {:?} -> {:?} hacia {}",
+                id,
+                pos,
+                next_pos,
+                dir.to_string(),
+            );
+
+            // Actualizar posición y seguir con la ruta
+            pos = next_pos;
+            route.remove(0);
+
+            // 5) Ceder CPU para que otros vehículos se muevan
+            my_thread_yield();
+        }
+
+        // Limpiar última celda
+        {
+            let city_ref = city();
+            let last_block = city_ref.get_mut(pos.0, pos.1);
+            last_block.set_occupant(None);
+            last_block.unlock_block();
+        }
+
+        println!("[Car {}] Terminado en {:?}", id, pos);
+        ptr::null_mut()
     }
 }
 
@@ -75,9 +193,7 @@ impl Vehicle {
 ///                                  Ciudad                                     ///
 /// --------------------------------------------------------------------------- ///
 
-/// Ancho y altura de la grid de la ciudad.
-pub const GRID_WIDTH: usize = 16;
-pub const GRID_HEIGHT: usize = 20;
+
 
 #[derive(Copy, Clone, Hash, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -99,7 +215,7 @@ pub enum BlockTask {
 }
 
 #[derive(Copy, Clone, Hash, Debug, PartialEq, Eq)]
-struct Directions {
+pub struct Directions {
     north: bool,
     south: bool, 
     east: bool,
@@ -157,8 +273,14 @@ pub enum Direction {
     West,
 }
 
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 #[derive(Debug)]
-struct Block {
+pub struct Block {
     pub kind: BlockKind,
     pub task: Option<BlockTask>,        // None si el bloque no tiene tarea especial
     pub dirs: Directions,               // direcciones válidas desde este bloque
@@ -329,59 +451,21 @@ pub fn direction_from_to(a: Coord, b: Coord) -> Option<Direction> {
     }
 }
 
-/// Crea una ciudad con el patrón especificado
-pub fn build_city() -> Matrix<Block> {
-    let mut city = Matrix::<Block>::new(GRID_HEIGHT, GRID_WIDTH);
+pub type City = Matrix<Block>;
 
-    // Patrón detallado basado en tu especificación
-    let pattern: [[char; GRID_WIDTH]; GRID_HEIGHT] = [
-        // 0
-        ['→', '→', '→', '↘', '→', '→', '→', '→', '→', '↘', '→', '→', '→', '→', '→', '↓'],
-        // 1
-        ['↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓'],
-        // 2
-        ['↑', 'b', 'b', '↓', 'b', 's', '↑', 'b', 'b', '↓', 's', 'b', '↑', 'b', 'b', '↓'],
-        // 3
-        ['↗', '→', '→', '↘', '→', '→', '↗', '→', '→', '↘', '→', '→', '↗', '→', '→', '↓'],
-        // 4
-        ['↑', 'b', 'b', '↓', 'n', 'n', '↑', 'b', 's', '↓', 'h', 'h', '↑', 'b', 'b', '↓'],
-        // 5
-        ['↑', 'b', 'b', '↓', 'n', 'n', '↑', 's', 'b', '↓', 'h', 'h', '↑', 'b', 'b', '↓'],
-        // 6
-        ['↑', '←', '←', '↙', '←', '←', '↖', '←', '←', '↙', '←', '←', '↖', '←', '←', '↙'],
-        // 7
-        ['↑', 'b', 'b', '↓', 'b', 's', '↑', 'b', 'b', '↓', 's', 'b', '↑', 'b', 'b', '↓'],
-        // 8
-        ['↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓'],
-        // 9
-        ['↑', '←', '←', '↙', '←', '←', '◁', '←', '←', '↙', '←', '←', '◁', '←', '←', '←'],
-        // 10
-        ['r', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', 'r'],
-        // 11
-        ['r', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'r', 'r'],
-        // 12
-        ['r', 'r', 'r', '↓', 'r', 'r', '↓', 'r', 'd', '↓', 'r', 'r', '↓', 'r', 'r', 'r'],
-        // 13
-        ['→', '→', '→', '↘', '→', '→', '→', '→', '→', '↘', '→', '→', '→', '→', '→', '↓'],
-        // 14
-        ['↑', 'b', 'b', '↓', 'b', 'b', '↑', 'n', 'n', '↓', 'b', 'b', '↑', 'b', 'b', '↓'],
-        // 15
-        ['↑', 'b', 'b', '↓', 's', 'b', '↑', 'n', 'n', '↓', 'b', 's', '↑', 'b', 'b', '↓'],
-        // 16
-        ['↗', '→', '→', '↘', '→', '→', '↗', '→', '→', '↘', '→', '→', '↗', '→', '→', '↓'],
-        // 17
-        ['↑', 'b', 'b', '↓', 'b', 's', '↑', 'b', 'b', '↓', 's', 'b', '↑', 'b', 'b', '↓'],
-        // 18
-        ['↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓', 'b', 'b', '↑', 'b', 'b', '↓'],
-        // 19
-        ['↑', '←', '←', '←', '←', '←', '↖', '←', '←', '←', '←', '←', '↖', '←', '←', '←'],
-    ];
+/// Crea una ciudad con el patrón especificado
+pub fn build_city() -> City {
+
+    let mut height = city_design::GRID_HEIGHT;
+    let mut width = city_design::GRID_WIDTH;
+    let mut design = CITY_DESIGN;
+    let mut city = City::new(height, width);
 
     // 1) Setear kind y directions.
-    for row in 0..GRID_HEIGHT {
-        for col in 0..GRID_WIDTH {
+    for row in 0..height {
+        for col in 0..width {
 
-            let kind = match pattern[row][col] {
+            let kind = match design[row][col] {
                 '↑' | '↓' | '→' | '←' | '↗' | '↖' | '↘' | '↙' | '◁' => BlockKind::Path,
                 'b' => BlockKind::Building,
                 'r' => BlockKind::River,
@@ -392,7 +476,7 @@ pub fn build_city() -> Matrix<Block> {
                 _   => BlockKind::Path,
             };
 
-            let directions = match pattern[row][col] {
+            let directions = match design[row][col] {
                 '↑' => Directions::north(),
                 '↓' => Directions::south(),
                 '→' => Directions::east(),
@@ -430,6 +514,18 @@ pub fn build_city() -> Matrix<Block> {
     }
 
     city
+
+}
+
+static mut CITY_PTR: *mut City = null_mut();
+
+fn city() -> &'static mut City {
+    unsafe {
+        if CITY_PTR.is_null() {
+            panic!("CITY_PTR no inicializado");
+        }
+        &mut *CITY_PTR
+    }
 }
 
 /// Función auxiliar para imprimir la ciudad de forma legible
@@ -471,6 +567,10 @@ pub fn print_detailed_city(city: &Matrix<Block>) {
     }
 }
 
+
+
+/// --------------------------------------------------------------------------- ///
+
 /// Función para contar bloques por tipo
 pub fn count_blocks_by_kind(city: &Matrix<Block>) -> HashMap<BlockKind, usize> {
     let mut counter = HashMap::new();
@@ -502,6 +602,59 @@ pub fn find_spawn_positions(city: &Matrix<Block>) -> Vec<Coord> {
     positions
 }
 
+/// Encuentra las tiendas en la ciudad
+pub fn find_shops(city: &Matrix<Block>) -> Vec<Coord> {
+    let mut coords: Vec<Coord> = Vec::new();
+    for row in 0..city.rows() {
+        for col in 0..city.cols() {
+            let block = city.get(row, col);
+            if block.kind == BlockKind::Shop {
+                coords.push((row, col));
+            }
+        }
+    }
+    coords
+}
+
+pub fn find_hospitals(city: &Matrix<Block>) -> Vec<Coord> {
+    let mut coords: Vec<Coord> = Vec::new();
+    for row in 0..city.rows() {
+        for col in 0..city.cols() {
+            let block = city.get(row, col);
+            if block.kind == BlockKind::Hospital {
+                coords.push((row, col));
+            }
+        }
+    }
+    coords
+}
+
+pub fn find_nuclear_plants(city: &Matrix<Block>) -> Vec<Coord> {
+    let mut coords: Vec<Coord> = Vec::new();
+    for row in 0..city.rows() {
+        for col in 0..city.cols() {
+            let block = city.get(row, col);
+            if block.kind == BlockKind::NuclearPlant {
+                coords.push((row, col));
+            }
+        }
+    }
+    coords
+}
+
+pub fn find_docks(city: &Matrix<Block>) -> Vec<Coord> {
+    let mut coords: Vec<Coord> = Vec::new();
+    for row in 0..city.rows() {
+        for col in 0..city.cols() {
+            let block = city.get(row, col);
+            if block.kind == BlockKind::Dock {
+                coords.push((row, col));
+            }
+        }
+    }
+    coords
+}
+
 /// Verifica si una coordenada es válida para un tipo de vehículo
 pub fn is_valid_position_for_vehicle(city: &Matrix<Block>, pos: Coord, vehicle_kind: VehicleKind) -> bool {
     let (row, col) = pos;
@@ -521,36 +674,63 @@ pub fn is_valid_position_for_vehicle(city: &Matrix<Block>, pos: Coord, vehicle_k
     }
 }
 
-/// Función que ejecuta cada hilo de vehículo.
-/// El argumento será un puntero a un Vehicle.
-extern "C" fn vehicle_thread(arg: *mut c_void) -> *mut c_void {
-    unsafe {
-        // Recuperar el vehículo desde el puntero
-        let vehicle: &mut Vehicle = &mut *(arg as *mut Vehicle);
+fn run_test_cars() {
 
-        println!("🚗 Iniciando vehículo {:?} desde {:?} hacia {:?}", vehicle.kind, vehicle.pos, vehicle.dest);
+    let spawns = find_spawn_positions(&city());
+    let shops = find_shops(&city());
 
-        while let Some(next_pos) = vehicle.route.first().cloned() {
-            // Simular movimiento: bloquear siguiente bloque
-            println!("   -> Vehículo {:?} moviéndose a {:?}", vehicle.kind, next_pos);
-            vehicle.pos = next_pos;
-            vehicle.route.remove(0);
+    let mut spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    let mut shopsplace = rand::thread_rng().gen_range(0..shops.len());
+    let vehicle1 = Vehicle::new(1, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
 
-            // Simular tiempo de desplazamiento (varía por tipo)
-            let delay = match vehicle.kind {
-                VehicleKind::Ambulance => 200,
-                VehicleKind::Car => 400,
-                VehicleKind::TruckWater | VehicleKind::TruckRadioactive => 600,
-                VehicleKind::Boat => 800,
-            };
-            my_thread_yield(); // cede CPU al scheduler cooperativo
-            sleep(Duration::from_millis(delay));
-        }
+    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    shopsplace = rand::thread_rng().gen_range(0..shops.len());
+    let vehicle2 = Vehicle::new(2, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
 
-        println!("✅ Vehículo {:?} llegó a destino {:?}", vehicle.kind, vehicle.dest);
+    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    shopsplace = rand::thread_rng().gen_range(0..shops.len());
+    let vehicle3 = Vehicle::new(3, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
 
-        ptr::null_mut()
+    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    shopsplace = rand::thread_rng().gen_range(0..shops.len());
+    let vehicle4 = Vehicle::new(4, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+
+    spawnplace = rand::thread_rng().gen_range(0..spawns.len());
+    shopsplace = rand::thread_rng().gen_range(0..shops.len());
+    let vehicle5 = Vehicle::new(5, VehicleKind::Car, spawns[spawnplace], shops[shopsplace], city());
+
+    let vehicles = vec![vehicle1, vehicle2, vehicle3, vehicle4, vehicle5];
+
+    let mut tids = Vec::new();
+
+    for vehicle in vehicles {
+        let id = vehicle.id;
+
+        // Empaquetar argumentos en el heap
+        let boxed = Box::new(vehicle);
+        let arg_ptr = Box::into_raw(boxed) as *mut c_void;
+
+        // Política de scheduling según el carro
+        let policy = match id {
+            1 => SchedPolicy::RoundRobin,
+            2 => SchedPolicy::RoundRobin,
+            3 => SchedPolicy::RoundRobin,
+            4 => SchedPolicy::RoundRobin,
+            5 => SchedPolicy::RoundRobin,
+            _ => SchedPolicy::RoundRobin,
+        };
+
+        let tid = my_thread_create(car_thread, arg_ptr, policy);
+        println!("[MAIN] Creado carro {} con tid {} y política {:?}", id, tid, policy);
+        tids.push(tid);
     }
+
+    // Esperar a que terminen los 5 carros
+    for tid in tids {
+        my_thread_join(tid);
+    }
+
+    println!("[MAIN] Todos los carros de prueba han terminado.");
 }
 
 /// --------------------------------------------------------------------------- ///
@@ -558,66 +738,54 @@ extern "C" fn vehicle_thread(arg: *mut c_void) -> *mut c_void {
 /// --------------------------------------------------------------------------- ///
 
 fn main() {
-    println!("🏙️ Iniciando simulación ThreadCity...");
 
     // Crear ciudad
-    let city = build_city();
+    let city_box = Box::new(build_city());
+    unsafe { CITY_PTR = Box::into_raw(city_box); }
+    let city = city();
     print_detailed_city(&city);
 
-    // Obtener puntos de spawn
-    let spawn_points = find_spawn_positions(&city);
-    let mut rng = thread_rng();
+    let kind_stats = count_blocks_by_kind(city);
+    let spawn_positions = find_spawn_positions(city);
 
-    let mut vehicles: Vec<Vehicle> = Vec::new();
-
-    // Crear 5 vehículos de distintos tipos
-    let vehicle_types = [
-        VehicleKind::Car,
-        VehicleKind::Ambulance,
-        VehicleKind::TruckWater,
-        VehicleKind::TruckRadioactive,
-        VehicleKind::Boat,
-    ];
-
-    for (i, kind) in vehicle_types.iter().enumerate() {
-        // Elegir inicio y fin distintos
-        let start = *spawn_points.choose(&mut rng).unwrap();
-        let mut goal = *spawn_points.choose(&mut rng).unwrap();
-        while goal == start {
-            goal = *spawn_points.choose(&mut rng).unwrap();
-        }
-
-        // Calcular ruta con BFS
-        if let Some(path) = bfs_path(&city, start, goal, *kind) {
-            let mut vehicle = Vehicle::new(i, *kind, start, goal, SchedPolicy::RoundRobin);
-            vehicle.route = path;
-            vehicles.push(vehicle);
-        } else {
-            println!("⚠️ No se encontró ruta para vehículo {:?}", kind);
-        }
-    }
-
-    println!("\n🚀 Lanzando hilos de vehículos...");
-
-    // Crear hilos para cada vehículo
-    for vehicle in vehicles.iter_mut() {
-        let ptr = vehicle as *mut Vehicle as *mut c_void;
-        let policy = match vehicle.kind {
-            VehicleKind::Ambulance => SchedPolicy::RealTime { deadline: 5000 },
-            VehicleKind::TruckRadioactive => SchedPolicy::Lottery { tickets: 5 },
-            _ => SchedPolicy::RoundRobin,
+    println!("\n=== ESTADÍSTICAS DE LA CIUDAD ===");
+    println!("\nPor tipo de bloque:");
+    for (kind, count) in kind_stats {
+        let kind_name = match kind {
+            BlockKind::Path => "Path",
+            BlockKind::Building => "Building",
+            BlockKind::River => "River",
+            BlockKind::Shop => "Shop",
+            BlockKind::NuclearPlant => "NuclearPlant",
+            BlockKind::Hospital => "Hospital",
+            BlockKind::Dock => "Dock",
         };
-
-        let tid = my_thread_create(vehicle_thread, ptr, policy);
-        vehicle.thread_id = Some(tid);
+        println!("  {}: {}", kind_name, count);
     }
 
-    // Esperar a que todos los hilos terminen
-    for vehicle in vehicles.iter_mut() {
-        if let Some(tid) = vehicle.thread_id {
-            my_thread_join(tid);
+    println!("Posiciones de spawn: {}", spawn_positions.len());
+
+    println!("\n=== VALIDACIÓN DE VEHÍCULOS ===");
+    let test_positions = [(0, 0), (10, 0), (12, 8), (4, 4)];
+    for &pos in &test_positions {
+        println!("\nPosición {:?}:", pos);
+        for vehicle_kind in [
+            VehicleKind::Car,
+            VehicleKind::Ambulance,
+            VehicleKind::TruckWater,
+            VehicleKind::TruckRadioactive,
+            VehicleKind::Boat,
+        ].iter()
+        {
+            let is_valid = is_valid_position_for_vehicle(city, pos, *vehicle_kind);
+            println!("  {:?}: {}", vehicle_kind, is_valid);
         }
     }
 
-    println!("\n🏁 Simulación terminada.");
+    // Aquí lanzamos la prueba con 5 autos
+    run_test_cars();
+
+    // Ya no necesitamos el testfunc
+    // let testthread = my_thread_create(testfunc, std::ptr::null_mut(), SchedPolicy::RoundRobin);
+    // my_thread_join(testthread);
 }

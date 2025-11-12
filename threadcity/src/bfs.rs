@@ -1,5 +1,5 @@
 use std::collections::{VecDeque, HashMap};
-use crate::{Matrix, Block, Coord, VehicleKind, is_valid_position_for_vehicle};
+use crate::{Block, BlockKind, BlockTask, Coord, Direction, Directions, Matrix, VehicleKind, is_valid_position_for_vehicle};
 
 /// Calcula una ruta usando BFS en la ciudad.
 /// Devuelve un vector de coordenadas desde start hasta goal (incluyendo ambos).
@@ -9,7 +9,8 @@ pub fn bfs_path(
     goal: Coord,
     vehicle_kind: VehicleKind,
 ) -> Option<Vec<Coord>> {
-    if start == goal {
+    // Verificar si ya estamos en el goal o a 1 bloque de distancia
+    if manhattan_distance(start, goal) <= 1 {
         return Some(vec![start]);
     }
 
@@ -19,8 +20,26 @@ pub fn bfs_path(
     queue.push_back(start);
     visited.insert(start, None);
 
+    pub fn direction_from_to(a: Coord, b: Coord) -> Option<Direction> {
+        let dy = b.0 as isize - a.0 as isize;
+        let dx = b.1 as isize - a.1 as isize;
+        match (dy, dx) {
+            (-1,  0) => Some(Direction::North),
+            ( 1,  0) => Some(Direction::South),
+            ( 0,  1) => Some(Direction::East),
+            ( 0, -1) => Some(Direction::West),
+            _        => None, // diagonal o salto de más de 1 celda: inválido
+        }
+    }
+
+    // Función auxiliar para calcular distancia Manhattan
+    fn manhattan_distance(a: Coord, b: Coord) -> usize {
+        ((a.0 as isize - b.0 as isize).abs() + (a.1 as isize - b.1 as isize).abs()) as usize
+    }
+
     while let Some(current) = queue.pop_front() {
         let (row, col) = current;
+        let block: &Block = Matrix::get(city, row, col);
 
         // Generar vecinos (arriba, abajo, derecha, izquierda)
         let dirs = [(-1, 0), (1, 0), (0, 1), (0, -1)];
@@ -47,10 +66,16 @@ pub fn bfs_path(
                 continue;
             }
 
+            let direction: Option<Direction> = direction_from_to(current, next);
+            if !block.allows_direction(direction.unwrap()) {
+                continue;
+            }
+
             visited.insert(next, Some(current));
 
-            if next == goal {
-                let mut path = vec![goal];
+            // MODIFICACIÓN: Verificar si estamos a 1 bloque de distancia del goal
+            if manhattan_distance(next, goal) <= 1 {
+                let mut path = vec![next];
                 let mut p = Some(current);
                 while let Some(prev) = p {
                     path.push(prev);
@@ -75,27 +100,71 @@ pub fn bfs_path(
     None
 }
 
+/// Función auxiliar para imprimir la ciudad con la ruta resaltada en rojo
 fn print_path_on_city(city: &Matrix<Block>, path: &Vec<Coord>) {
-    let mut display = vec![vec![' '; city.cols()]; city.rows()];
-
-    for r in 0..city.rows() {
-        for c in 0..city.cols() {
-            if is_valid_position_for_vehicle(city, (r, c), VehicleKind::Car) {
-                display[r][c] = '.';
-            } else {
-                display[r][c] = '■';
+    println!("\n Mapa con ruta marcada en ROJO:");
+    println!("Leyenda: ");
+    println!("'•' = Path, '■' = Building, '~' = River, '⌂' = Shop");
+    println!("'☢' = NuclearPlant, '✙' = Hospital, '█' = Dock, '◉' = Spawn task \n ");
+    println!("\x1b[31m'*'\x1b[0m = Ruta \n ");
+    
+    for row in 0..city.rows() {
+        for col in 0..city.cols() {
+            let coord = (row, col);
+            
+            // Si la coordenada está en la ruta, imprimir en rojo
+            if path.contains(&coord) {
+                print!("\x1b[31m*\x1b[0m "); // Carácter * en rojo
+                continue;
             }
-        }
-    }
+            
+            let block = Matrix::get(city, row, col);
+            let symbol = match block.kind {
+                BlockKind::Path => "•",
+                BlockKind::Building => "■",
+                BlockKind::River => "~",
+                BlockKind::Shop => "⌂",
+                BlockKind::NuclearPlant => "☢",
+                BlockKind::Hospital => "✙",
+                BlockKind::Dock => "█",
+            };
 
-    for &(r, c) in path {
-        display[r][c] = '*';
-    }
-
-    println!("\n🗺️ Mapa con ruta marcada:\n");
-    for row in display {
-        for ch in row {
-            print!("{}", ch);
+            
+            
+            // Mostrar otros
+            if block.task == Some(BlockTask::Spawn) { 
+                print!("◉ "); 
+            }
+            else if block.dirs == Directions::north() { 
+                print!("↑ "); 
+            }
+            else if block.dirs == Directions::south() { 
+                print!("↓ "); 
+            }
+            else if block.dirs == Directions::east()  { 
+                print!("→ "); 
+            }
+            else if block.dirs == Directions::west()  { 
+                print!("← "); 
+            }
+            else if block.dirs == Directions::north_east()  { 
+                print!("↗ "); 
+            }
+            else if block.dirs == Directions::north_west()  { 
+                print!("↖ "); 
+            }
+            else if block.dirs == Directions::south_east()  { 
+                print!("↘ "); 
+            }
+            else if block.dirs == Directions::south_west()  { 
+                print!("↙ "); 
+            }
+            else if block.dirs == Directions::north_south_west()  { 
+                print!("◁ "); 
+            }
+            else {
+                print!("{} ", symbol);
+            }
         }
         println!();
     }
